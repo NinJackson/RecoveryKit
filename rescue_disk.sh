@@ -27,6 +27,7 @@
 set -u
 set -o pipefail
 
+KIT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEST=""; LABEL="rescue_$(date +%Y%m%d)"; DEVICE=""; SIZE_GB=""
 RETRIES=3; MAXCYCLES=15; TMAX=300; YES=0; FORCE=0; CLEANUP=0
 
@@ -94,11 +95,15 @@ externals() {
     | awk '$1 ~ /^\/dev\/disk[0-9]+$/ && /external/ { d=$1; sub(/^\/dev\//,"",d); print d }'
 }
 
+if [ -x "$KIT_DIR/tools/install_dependencies.sh" ]; then
+  "$KIT_DIR/tools/install_dependencies.sh" --require ddrescue
+fi
+
 DDR=""; DLOG=""
-for p in /Users/service/RecoveryKit/tools/bin /Users/service/TDM_Recovery/tools/bin /usr/local/bin /opt/homebrew/bin; do
+for p in "$KIT_DIR/tools/bin" /Users/service/RecoveryKit/tools/bin /Users/service/TDM_Recovery/tools/bin /usr/local/bin /opt/homebrew/bin; do
   [ -x "$p/ddrescue" ] && DDR="$p/ddrescue" && DLOG="$p/ddrescuelog" && break
 done
-[ -n "$DDR" ] || die "ddrescue not found (expected in RecoveryKit/tools/bin)"
+[ -n "$DDR" ] || die "ddrescue not found (expected in $KIT_DIR/tools/bin)"
 [ -x "$DLOG" ] || die "ddrescuelog not found next to ddrescue"
 log "using $("$DDR" --version | head -1)"
 

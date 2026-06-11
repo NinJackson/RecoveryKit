@@ -5,6 +5,7 @@
 # ACCEPTS: image
 
 set -u
+KIT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEST=""; LABEL=""; IMAGE=""
 while [ $# -gt 0 ]; do case "$1" in
   --dest)  [ $# -ge 2 ] || { echo "--dest requires a path"; exit 2; }; DEST="$2"; shift 2;;
@@ -24,12 +25,16 @@ LOGF="$DEST/$LABEL.carve.log"
 exec > >(tee -a "$LOGF") 2>&1
 ts() { date '+%F %T'; }
 
-# Locate the bundled universal PhotoRec.
+if [ -x "$KIT_DIR/tools/install_dependencies.sh" ]; then
+  "$KIT_DIR/tools/install_dependencies.sh" --require photorec
+fi
+
+# Locate the bundled/installed PhotoRec.
 PR=""
-for p in /Users/service/RecoveryKit/tools/bin /usr/local/bin /opt/homebrew/bin; do
+for p in "$KIT_DIR/tools/bin" /Users/service/RecoveryKit/tools/bin /usr/local/bin /opt/homebrew/bin; do
   [ -x "$p/photorec" ] && PR="$p/photorec" && break
 done
-[ -n "$PR" ] || { echo "photorec not found (expected in RecoveryKit/tools/bin)"; exit 1; }
+[ -n "$PR" ] || { echo "photorec not found (expected in $KIT_DIR/tools/bin)"; exit 1; }
 
 mkdir -p "$OUT"
 echo "[$(ts)] carving $IMG"

@@ -44,6 +44,28 @@ appears in the GUI, no app rebuild needed. Contract:
 
 Rebuild the app after editing `gui/main.swift`: `bash gui/build.sh`.
 
+## Dependencies
+
+RecoveryKit keeps third-party tools in `tools/bin/` so the scripts do not need
+system-wide installs. Methods automatically run:
+
+```
+bash tools/install_dependencies.sh --require <tool>
+```
+
+before they look up their tool. You can also preflight everything manually:
+
+```
+bash tools/install_dependencies.sh --all
+```
+
+The installer first uses existing bundled binaries, then copies tools already
+on `PATH`, then tries Homebrew if it is installed, then falls back to upstream
+downloads where practical. PhotoRec is downloaded from CGSecurity's portable
+TestDisk/PhotoRec macOS archive. GNU ddrescue is built from GNU source when a
+compiler and `lzip` are available; otherwise the installer tells you exactly
+which binary to place in `tools/bin/`.
+
 ## GUI on old macOS (10.14.6 Mojave and up)
 
 `RecoveryKit.app` is an arm64 Swift build and won't run on Intel Mojave.
@@ -73,6 +95,11 @@ show up in both GUIs.
   `WholeDisks` / `AllDisksAndPartitions` keys.
 - **Shell is bash 3.2-safe** — the version Apple ships everywhere, Mojave
   included (it's also what `/bin/bash` is on this machine).
+- **Dependency bootstrap is local.** Missing tools are installed into
+  `tools/bin/`; the scripts do not require `/usr/local` or `/opt/homebrew` to
+  be writable. On Mojave, the PhotoRec fallback uses CGSecurity's Intel macOS
+  archive, and ddrescue can be copied from PATH/Homebrew or built from source
+  when Command Line Tools plus `lzip` are present.
 
 > Untested on real 10.14.6 hardware from this build machine — it's written to
 > the documented Mojave behavior and verified on macOS 26. Validate on the
