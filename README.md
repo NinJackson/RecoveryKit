@@ -1,8 +1,7 @@
 # RecoveryKit — failing-drive imaging for service jobs
 
 One command images a dying external/TDM drive onto a job drive, surviving
-dropouts, reboots, and disk renumbering. Built after job 68930 (Cislak),
-2026-06-11.
+dropouts, reboots, and disk renumbering.
 
 ## GUI (modern Macs)
 
