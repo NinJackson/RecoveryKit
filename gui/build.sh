@@ -6,6 +6,7 @@ APP="../RecoveryKit.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/"
+cp RecoveryKit.icns "$APP/Contents/Resources/"
 # -swift-version 5: avoid Swift 6 strict-concurrency errors in plain AppKit code
 xcrun swiftc -O -swift-version 5 main.swift -o "$APP/Contents/MacOS/RecoveryKit"
 codesign --force --sign - "$APP" 2>/dev/null || true

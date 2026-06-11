@@ -3,9 +3,22 @@
 <plist version="1.0">
 <dict>
 	<key>files</key>
-	<dict/>
+	<dict>
+		<key>Resources/RecoveryKit.icns</key>
+		<data>
+		/73Xazi3wThAj1SU3zH2s5apPUc=
+		</data>
+	</dict>
 	<key>files2</key>
-	<dict/>
+	<dict>
+		<key>Resources/RecoveryKit.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			kiFPdvqUe2vCErs288oScoiUkQBCb4y/I//2fGTuX8I=
+			</data>
+		</dict>
+	</dict>
 	<key>rules</key>
 	<dict>
 		<key>^Resources/</key>

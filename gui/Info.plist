@@ -8,6 +8,8 @@
 	<string>RecoveryKit</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.service.recoverykit</string>
+	<key>CFBundleIconFile</key>
+	<string>RecoveryKit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

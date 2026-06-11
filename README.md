@@ -4,13 +4,18 @@ One command images a dying external/TDM drive onto a job drive, surviving
 dropouts, reboots, and disk renumbering. Built after job 68930 (Cislak),
 2026-06-11.
 
-## GUI
+## GUI (modern Macs)
 
 Open `RecoveryKit.app` (double-click). Pick a method, the source disk, the
 destination job volume, set a job label, hit **Run in Terminal** — the
 method opens in Terminal where you type the sudo password and watch live
 progress. The app tails the job's log file at the bottom. First run asks
 permission to control Terminal: allow it.
+
+The **Image file** field (with **Browse…**) points the extract/carve methods
+at any recovered `.img` — handy when it isn't named by the kit convention or
+lives elsewhere. Leave it blank to use the job's `<label>.img`. It's passed as
+`--image`; methods that don't take an image ignore it.
 
 The **Source disk** menu lists attached external disks (re-scanned every
 10 s; the destination's own disk is never offered) and passes the choice
@@ -26,14 +31,53 @@ Drop an executable `NN_name.sh` into `methods/` and hit Refresh — it
 appears in the GUI, no app rebuild needed. Contract:
 
 - Header lines `# NAME: <menu title>` and `# DESC: <one-line description>`.
+- Optional `# ACCEPTS: image` — declares the method takes a `--image <path>`
+  (a specific `.img`). The GUIs then offer the image picker for it; methods
+  without the header don't see it. The kit's image consumers (`20_`, `30_`)
+  honor `--image`, falling back to `DEST/LABEL.img` when it's blank.
 - Gets called as `sudo bash <script> --dest "/Volumes/<job>" --label <label>`
-  plus whatever the tech typed in "Extra args"; ignore flags you don't use.
+  (plus `--device`/`--image` when set, and anything in "Extra args"); ignore
+  flags you don't use.
 - Log to `$DEST/$LABEL*.log` so the GUI's log pane picks it up.
 - Lower `NN_` prefixes sort first in the menu. Current methods:
-  `10_` image with ddrescue, `20_` extract files from the image,
-  `90_` remove fstab guards when a job closes.
+  `10_` image with ddrescue, `20_` extract files from a readable image,
+  `30_` carve files from an unreadable image, `90_` remove fstab guards.
 
 Rebuild the app after editing `gui/main.swift`: `bash gui/build.sh`.
+
+## GUI on old macOS (10.14.6 Mojave and up)
+
+`RecoveryKit.app` is an arm64 Swift build and won't run on Intel Mojave.
+For old bench Macs use the **classic GUI** instead:
+
+```
+open ~/RecoveryKit/rescue_gui_classic.command
+```
+
+Double-click it in Finder (first launch: right-click → Open, to clear
+Gatekeeper). It's pure `bash` + `osascript` + Terminal — no compiled code,
+no Swift runtime — so the one file runs unchanged from 10.14.6 to current.
+Native dialogs collect method / destination / source disk / label, then the
+chosen method runs with `sudo` right in that Terminal window with live
+ddrescue output. It reads the same `methods/` folder, so methods you add
+show up in both GUIs.
+
+### What makes the kit run on 10.14.6
+
+- **ddrescue is a universal binary** (`x86_64` + `arm64`, x86_64 slice built
+  with `-mmacosx-version-min=10.14`). Same `tools/bin/ddrescue` runs on Intel
+  Mojave and Apple Silicon. Rebuild the Intel slice: see `gui/build.sh` notes
+  and `~/TDM_Recovery/build/`.
+- **Plist reads are portable.** Scalars use `plutil -extract` and fall back to
+  `/usr/libexec/PlistBuddy` (older `plutil` lacks `-extract … -o -`); disk and
+  partition lists are parsed from `diskutil`'s text output, not the `-plist`
+  `WholeDisks` / `AllDisksAndPartitions` keys.
+- **Shell is bash 3.2-safe** — the version Apple ships everywhere, Mojave
+  included (it's also what `/bin/bash` is on this machine).
+
+> Untested on real 10.14.6 hardware from this build machine — it's written to
+> the documented Mojave behavior and verified on macOS 26. Validate on the
+> actual bench Mac with a throwaway disk before trusting a customer drive.
 
 ## Quick start (CLI)
 
@@ -73,10 +117,32 @@ diskutil list                      # find the synthesized container
 diskutil mount readOnly diskNsM    # mount volumes from the image
 ```
 
-If mounting the image's APFS volume also misbehaves (same apfs.kext code
-path), do it right after a fresh boot with no other jobs running, or fall
-back to `apfs-fuse` / professional tools against the image file.
+### Opening / reading a recovered image
 
-`tools/bin/` holds GNU ddrescue 1.29 + ddrescuelog built from source
-(Homebrew on this Mac has broken /usr/local permissions). Source tarballs
-and build scripts: `~/TDM_Recovery/build/` and `~/TDM_Recovery/*.sh`.
+- **Image the OS can read** → *Extract files from image* (`20_`). Attaches
+  read-only and rsyncs the files out, preserving names and folders. Note this
+  mounts the image's filesystem, which carries the same apfs.kext panic risk
+  as the original drive if the image is corrupt — only use it on images that
+  attach cleanly.
+- **Image the OS CANNOT read** (corrupt/partial filesystem — mount fails or
+  would panic) → *Recover files from UNREADABLE image (carve)* (`30_`). This
+  is the answer when "open it normally" doesn't work. PhotoRec scans the raw
+  image byte-by-byte and reconstructs files from their content signatures into
+  `DEST/carved/` — it never mounts anything and never invokes the kernel
+  filesystem driver, so there's nothing to fail or panic. It recovers file
+  **content by type** (jpg, png, pdf, docx, …); original filenames and folder
+  structure are lost (that information lived in the unreadable metadata). When
+  in doubt, prefer carving — it's the safe path.
+
+If mounting the image's APFS volume misbehaves (same apfs.kext code path), do
+it right after a fresh boot with no other jobs running, use the carve method
+instead, or fall back to `apfs-fuse` / professional tools against the image.
+
+`tools/bin/` holds GNU ddrescue 1.29 + ddrescuelog and PhotoRec 7.2 as
+**universal binaries** (`x86_64` + `arm64`, linking only system libs) built
+from source (Homebrew on this Mac has broken
+/usr/local permissions). Source tarballs and build scripts:
+`~/TDM_Recovery/build/` and `~/TDM_Recovery/*.sh`. To rebuild the Intel slice:
+`./configure CXX=clang++ CXXFLAGS="-arch x86_64 -mmacosx-version-min=10.14 -O2"
+LDFLAGS="-arch x86_64 -mmacosx-version-min=10.14"` then `lipo -create` the two
+arch builds.

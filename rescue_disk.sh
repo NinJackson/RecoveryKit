@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --retries) [ $# -ge 2 ] || { echo "--retries requires a number"; exit 2; }; RETRIES="$2"; shift 2;;
   --max-cycles) [ $# -ge 2 ] || { echo "--max-cycles requires a number"; exit 2; }; MAXCYCLES="$2"; shift 2;;
   --timeout-secs) [ $# -ge 2 ] || { echo "--timeout-secs requires a number"; exit 2; }; TMAX="$2"; shift 2;;
+  --image) shift; [ $# -gt 0 ] && shift;;   # ignored here (imaging creates the image); accepted so GUIs can pass it uniformly
   --yes) YES=1; shift;;
   --force) FORCE=1; shift;;
   --cleanup-fstab) CLEANUP=1; shift;;
@@ -74,13 +75,23 @@ STATE="$DEST/$LABEL.target"; LOGF="$DEST/$LABEL.log"
 exec > >(tee -a "$LOGF") 2>&1
 log "=== rescue_disk start; label=$LABEL dest=$DEST ==="
 
-# plutil -extract with stdin input prints to stdout; -o - made explicit anyway.
-pl() { diskutil info -plist "$1" 2>/dev/null | plutil -extract "$2" raw -o - - 2>/dev/null; }
+# Portable plist scalar read: prefer `plutil -extract` (fast, modern macOS),
+# fall back to PlistBuddy on older systems (10.14) where it may be missing.
+pl() {
+  local tmp v
+  tmp=$(mktemp "${TMPDIR:-/tmp}/rk_pl.XXXXXX") || return 1
+  diskutil info -plist "$1" >"$tmp" 2>/dev/null
+  v=$(plutil -extract "$2" raw -o - "$tmp" 2>/dev/null)
+  [ -n "$v" ] || v=$(/usr/libexec/PlistBuddy -c "Print :$2" "$tmp" 2>/dev/null)
+  rm -f "$tmp"
+  printf '%s' "$v"
+}
 wholeof() { echo "${1#/dev/}" | sed -E 's/(s[0-9]+)+$//'; }
+# External whole disks via diskutil's text output (stable 10.14→present);
+# avoids the -plist WholeDisks key, which older plutil can't extract.
 externals() {
-  diskutil list -plist external physical 2>/dev/null \
-    | plutil -extract WholeDisks json -o - - 2>/dev/null \
-    | tr -d '[]" ' | tr ',' ' '
+  diskutil list external physical 2>/dev/null \
+    | awk '$1 ~ /^\/dev\/disk[0-9]+$/ && /external/ { d=$1; sub(/^\/dev\//,"",d); print d }'
 }
 
 DDR=""; DLOG=""
@@ -94,9 +105,8 @@ log "using $("$DDR" --version | head -1)"
 # Never offer the destination's own disk (or its APFS physical stores) as a target.
 EXCL=""
 PW=$(pl "$DEST" ParentWholeDisk); [ -n "$PW" ] && EXCL="$PW"
-for d in $(diskutil info -plist "$DEST" 2>/dev/null \
-             | plutil -extract APFSPhysicalStores json -o - - 2>/dev/null \
-             | grep -oE 'disk[0-9]+(s[0-9]+)?'); do
+for d in $(diskutil info "$DEST" 2>/dev/null \
+             | awk -F: '/APFS Physical Store/ { gsub(/[[:space:]]/,"",$2); print $2 }'); do
   EXCL="$EXCL $(wholeof "$d")"
 done
 excluded() { case " $EXCL " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -156,10 +166,9 @@ find_target() {  # echoes disk id; uses saved DiskUUID/size to survive renumberi
 guard_and_unmount() {  # $1 = physical whole disk
   local d="$1" devid uuid fstype cont
   # fstab noauto per volume UUID: diskarbitration then leaves the patient alone.
-  for devid in $(diskutil list -plist "$d" 2>/dev/null \
-                   | plutil -extract AllDisksAndPartitions json -o - - 2>/dev/null \
-                   | grep -oE '"DeviceIdentifier" *: *"disk[0-9]+(s[0-9]+)?"' \
-                   | grep -oE 'disk[0-9]+(s[0-9]+)?'); do
+  # Partition identifiers come from diskutil's text output (portable to 10.14).
+  for devid in $(diskutil list "$d" 2>/dev/null \
+                   | awk '{print $NF}' | grep -oE '^disk[0-9]+s[0-9]+$'); do
     uuid=$(pl "$devid" VolumeUUID); [ -n "$uuid" ] || continue
     fstype=$(pl "$devid" FilesystemType); [ -n "$fstype" ] || fstype=apfs
     grep -q "$uuid" /etc/fstab 2>/dev/null \

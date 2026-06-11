@@ -20,6 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let sourcePopup = NSPopUpButton()
     let destPopup = NSPopUpButton()
     let labelField = NSTextField()
+    let imageField = NSTextField()
     let argsField = NSTextField()
     let descLabel = NSTextField(wrappingLabelWithString: "")
     let statusLabel = NSTextField(labelWithString: "Ready.")
@@ -87,7 +88,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         labelField.stringValue = defaultLabel()
         labelField.placeholderString = "file basename for image/map/log"
+        imageField.placeholderString = "optional .img for Extract/Carve — blank uses <label>.img"
         argsField.placeholderString = "extra args, e.g. --size-gb 251 --yes"
+
+        let browseBtn = NSButton(title: "Browse…", target: self, action: #selector(browseImage))
+        browseBtn.bezelStyle = .rounded
+        let imageRow = NSStackView(views: [imageField, browseBtn])
+        imageRow.orientation = .horizontal
+        imageRow.spacing = 8
 
         descLabel.textColor = .secondaryLabelColor
         descLabel.font = NSFont.systemFont(ofSize: 11)
@@ -114,6 +122,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             row("Source disk:", sourcePopup),
             row("Destination:", destPopup),
             row("Job label:", labelField),
+            row("Image file:", imageRow),
             row("Extra args:", argsField),
             buttons,
             NSTextField(labelWithString: "Job log:"),
@@ -135,6 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sourcePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 380),
             destPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 380),
             labelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 380),
+            imageField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
             argsField.widthAnchor.constraint(greaterThanOrEqualToConstant: 380),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             descLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -242,6 +252,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return vols.filter { !$0.hasPrefix(".") }.sorted()
     }
 
+    @objc func browseImage() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a recovered disk image (.img) to extract or carve"
+        // Start in the selected destination volume, where images are written.
+        if let destName = destPopup.titleOfSelectedItem {
+            panel.directoryURL = URL(fileURLWithPath: "/Volumes/" + destName)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            imageField.stringValue = url.path
+        }
+    }
+
     @objc func refreshClicked() { reload() }
 
     func reload() {
@@ -281,6 +306,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let label = labelField.stringValue.isEmpty ? defaultLabel() : labelField.stringValue
         var cmd = "sudo bash \(shq(methods[i].path)) --dest \(shq(dest)) --label \(shq(label))"
         if let src = selectedSourceID() { cmd += " --device " + src }
+        let image = imageField.stringValue.trimmingCharacters(in: .whitespaces)
+        if !image.isEmpty { cmd += " --image " + shq(image) }
         let extra = argsField.stringValue.trimmingCharacters(in: .whitespaces)
         if !extra.isEmpty { cmd += " " + extra }
 
@@ -302,7 +329,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let label = labelField.stringValue.isEmpty ? defaultLabel() : labelField.stringValue
         let base = "/Volumes/\(destName)/\(label)"
         var text = ""
-        for suffix in [".log", ".extract.log"] {
+        for suffix in [".log", ".extract.log", ".carve.log"] {
             if let t = try? String(contentsOfFile: base + suffix, encoding: .utf8), !t.isEmpty {
                 text += "──── \(label + suffix) ────\n" + String(t.suffix(5000)) + "\n"
             }

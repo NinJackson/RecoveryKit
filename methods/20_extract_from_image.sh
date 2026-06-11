@@ -2,18 +2,21 @@
 # NAME: Extract files from image
 # DESC: Attaches DEST/LABEL.img read-only, mounts each data volume inside it, copies all readable files to DEST/extracted/<Volume>/, then detaches. Run after imaging completes.
 # REQUIRES_ROOT: yes
+# ACCEPTS: image
 
 set -u
-DEST=""; LABEL=""
+DEST=""; LABEL=""; IMAGE=""
 while [ $# -gt 0 ]; do case "$1" in
   --dest) [ $# -ge 2 ] || { echo "--dest requires a path"; exit 2; }; DEST="$2"; shift 2;;
   --label) [ $# -ge 2 ] || { echo "--label requires a name"; exit 2; }; LABEL="$2"; shift 2;;
+  --image) [ $# -ge 2 ] || { echo "--image requires a path"; exit 2; }; IMAGE="$2"; shift 2;;
   *) shift;;   # tolerate args meant for other methods
 esac; done
 [ -n "$DEST" ] && [ -n "$LABEL" ] || { echo "need --dest and --label"; exit 2; }
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
 
-IMG="$DEST/$LABEL.img"
+# --image points at any recovered .img; otherwise use the kit's DEST/LABEL.img.
+IMG="${IMAGE:-$DEST/$LABEL.img}"
 OUT="$DEST/extracted"
 LOGF="$DEST/$LABEL.extract.log"
 [ -f "$IMG" ] || { echo "image not found: $IMG"; exit 1; }
@@ -44,15 +47,23 @@ WHOLE="${ATTACHED#/dev/}"
 echo "[$(ts)] image attached as $WHOLE"
 sleep 5   # give APFS time to synthesize containers from the image
 
-pl() { diskutil info -plist "$1" 2>/dev/null | plutil -extract "$2" raw -o - - 2>/dev/null; }
+# Portable plist scalar read (plutil on modern macOS, PlistBuddy on 10.14).
+pl() {
+  local tmp v
+  tmp=$(mktemp "${TMPDIR:-/tmp}/rk_pl.XXXXXX") || return 1
+  diskutil info -plist "$1" >"$tmp" 2>/dev/null
+  v=$(plutil -extract "$2" raw -o - "$tmp" 2>/dev/null)
+  [ -n "$v" ] || v=$(/usr/libexec/PlistBuddy -c "Print :$2" "$tmp" 2>/dev/null)
+  rm -f "$tmp"
+  printf '%s' "$v"
+}
 
 # Volumes = plain slices of the attached disk + volumes of any APFS container
 # whose physical store lives on it. Helper volumes carry no customer data.
 SKIP="VM|Preboot|Recovery|EFI|Update|xART|iSCPreboot|Hardware"
 VOLS=$(
-  diskutil list -plist "$WHOLE" 2>/dev/null \
-    | plutil -extract AllDisksAndPartitions json -o - - 2>/dev/null \
-    | grep -oE '"DeviceIdentifier" *: *"disk[0-9]+s[0-9]+"' | grep -oE 'disk[0-9]+s[0-9]+'
+  diskutil list "$WHOLE" 2>/dev/null \
+    | awk '{print $NF}' | grep -oE '^disk[0-9]+s[0-9]+$'
   diskutil apfs list 2>/dev/null | awk -v phys="$WHOLE" '
     /\+-- Container disk/ {ph=0}
     /\+-< Physical Store/ {n=$4; sub(/(s[0-9]+)+$/,"",n); if (n==phys) ph=1}
