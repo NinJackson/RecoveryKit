@@ -64,17 +64,20 @@ SKIP="VM|Preboot|Recovery|EFI|Update|xART|iSCPreboot|Hardware"
 VOLS=$(
   diskutil list "$WHOLE" 2>/dev/null \
     | awk '{print $NF}' | grep -oE '^disk[0-9]+s[0-9]+$'
+  # End-of-line fields: non-last containers carry a leading "|" column that
+  # shifts $1..$4 in diskutil apfs list output.
   diskutil apfs list 2>/dev/null | awk -v phys="$WHOLE" '
-    /\+-- Container disk/ {ph=0}
-    /\+-< Physical Store/ {n=$4; sub(/(s[0-9]+)+$/,"",n); if (n==phys) ph=1}
-    ph && /\+-> Volume disk/ {print $3}
+    /\+-- Container disk[0-9]+/ {ph=0}
+    /\+-< Physical Store disk[0-9]+/ {n=$(NF-1); sub(/(s[0-9]+)+$/,"",n); if (n==phys) ph=1}
+    ph && /\+-> Volume disk[0-9]+/ {print $(NF-1)}
   '
 )
 
 COPIED=0
 for v in $VOLS; do
   NAME=$(pl "$v" VolumeName); [ -n "$NAME" ] || continue
-  echo "$NAME" | grep -qE "^($SKIP)" && { echo "[$(ts)] skip helper volume $v ($NAME)"; continue; }
+  # Exact-name match only: customer volumes like "Recovery Photos" must not be skipped.
+  echo "$NAME" | grep -qxE "($SKIP)" && { echo "[$(ts)] skip helper volume $v ($NAME)"; continue; }
   if ! diskutil mount readOnly "$v" >/dev/null 2>&1; then
     echo "[$(ts)] WARN: could not mount $v ($NAME) — skipping"
     continue
@@ -86,7 +89,7 @@ for v in $VOLS; do
     diskutil unmount "$v" >/dev/null 2>&1
     continue
   }
-  SAFE=$(echo "$NAME" | tr -c 'A-Za-z0-9._ -' '_')
+  SAFE=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._ -' '_')
   echo "[$(ts)] copying '$NAME' ($v) -> $OUT/$SAFE/"
   mkdir -p "$OUT/$SAFE"
   rsync -rlptD -v \

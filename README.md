@@ -11,6 +11,18 @@ method opens in Terminal where you type the sudo password and watch live
 progress. The app tails the job's log file at the bottom. First run asks
 permission to control Terminal: allow it.
 
+The app is **job-aware**: the **Job** menu lists jobs already on the selected
+drive (newest first, preselected so you continue rather than fork a job;
+"— new job —" generates a collision-free label). The **Job state** strip
+shows what exists for the selected job (image/hash, recovered files, triage,
+delivery, plus ⚙️ RUN ACTIVE when a lock shows something running), and the
+**Next:** line suggests the next pipeline step — "Select suggested" picks it
+in the Method menu. Every **Run** opens a pre-flight summary first, with
+computed warnings: placeholder-sized source, image won't fit on the
+destination, run resumes an existing image, missing image for extract/carve,
+and which fstab guard lines a cleanup will touch. The classic GUI shows the
+same kind of confirmation dialog before executing.
+
 The **Image file** field (with **Browse…**) points the extract/carve methods
 at any recovered `.img` — handy when it isn't named by the kit convention or
 lives elsewhere. Leave it blank to use the job's `<label>.img`. It's passed as
@@ -39,8 +51,15 @@ appears in the GUI, no app rebuild needed. Contract:
   flags you don't use.
 - Log to `$DEST/$LABEL*.log` so the GUI's log pane picks it up.
 - Lower `NN_` prefixes sort first in the menu. Current methods:
-  `10_` image with ddrescue, `20_` extract files from a readable image,
-  `30_` carve files from an unreadable image, `90_` remove fstab guards.
+  `05_` probe patient (read-only diagnostics), `10_` image with ddrescue,
+  `15_` verify image (SHA-256 + map health), `20_` extract from a readable
+  image (mounts it), `25_` extract WITHOUT mounting (Sleuth Kit — names and
+  folders, zero kernel-mount risk), `30_` carve an unreadable image,
+  `35_` deduplicate recovered output, `40_` triage carved files into user
+  data vs junk, `45_` organize photos by EXIF date, `60_` package customer
+  delivery (manifest + README), `70_` generate the final job report,
+  `80_` archive job artifacts with hash verification, `90_` remove fstab
+  guards (label-scoped).
 
 Rebuild the app after editing `gui/main.swift`: `bash gui/build.sh`.
 
@@ -117,6 +136,51 @@ adapter, fully off, power on holding **T**, replug the Thunderbolt cable once
 the TDM symbol shows. Re-run the same command any time: the `.map` file
 resumes exactly where it stopped.
 
+## Field notes — diagnosing "uninitialized" USB drives
+
+A USB-SATA enclosure that shows a tiny disk with no partition map usually
+means the bridge's SATA handshake failed — the patient never answered ATA
+IDENTIFY. Signatures and probes:
+
+- **ASMedia bridges (ASMT 2235/2115/1153E, USB id `174c:55aa`) report a
+  placeholder LUN of exactly 40961 × 512 B = 21.0 MB when no disk
+  identifies.** Disk Utility shows "uninitialized ASMT xxxx Media". This is
+  the bridge talking, not the drive — nothing is mountable, initializing it
+  writes nothing useful, and macOS cannot reach the drive behind it.
+- Probe commands (no root): `diskutil info diskN` (MediaName/size),
+  `ioreg -p IOUSB -l -w0 | grep -iE 'Product Name|idVendor|idProduct'`
+  (bridge identity), `ioreg -c IOSCSIPeripheralDeviceNub -l -w0 | grep -iE
+  'Vendor Identification|Product Identification'` (what SCSI identity the
+  bridge fabricates), and `tools/new_disk_watch.sh` to catch real
+  enumeration the moment it happens.
+- **A tiny capacity that persists on direct SATA is the drive's own ROM-mode
+  IDENTIFY, not a bridge artifact** (confirmed on a bricked Silicon Power A55:
+  ~20 MB behind two ASMedia bridges AND on a native AHCI port). Controller
+  answering IDENTIFY with placeholder capacity = recoverable presentation;
+  read the model string (`system_profiler SPSerialATADataType`) to identify
+  the controller family and pick the loader path.
+- Same placeholder in two different enclosures ⇒ the drive is the problem.
+  macOS userspace cannot send ATA/SCSI passthrough over USB — verified
+  upstream: smartmontools issue #254, closed wontfix ("cannot be fixed in
+  smartctl"); Apple's stack claims USB disks exclusively. So ATA-level
+  interrogation (true IDENTIFY, SMART) needs direct SATA on a Linux/Windows
+  bench machine or PC-3000. A Linux VM with USB passthrough works only for
+  healthy-ish drives — macOS probes/attempts mounting before the VM can
+  capture the device, which is unacceptable on dying media.
+- Bricked-SSD IDENTIFY triage (direct SATA, hot-plug, Linux `hdparm -I`):
+  identifies as **"SATAFIRM S11"** = Phison PS3111 ROM fallback, FTL dead,
+  data intact → PC-3000/DFL loader+translator imaging. **Silicon string**
+  (SM2258XT/SM2259XT) or tiny capacity (0.12 MB/2 MB/1 GB/1023 MB) = SMI or
+  Maxio ROM/panic mode → same loader approach (pin-short to safe mode).
+  **Total silence / brief-then-gone** = SMI "Keep BSY" or Maxio init loop —
+  USB bridges mask BSY, so such drives look dead behind any enclosure.
+  NEVER run vendor MP tools (Phison MPALL/SATA Tool, SMI MPTool, repairS11):
+  they rebuild an EMPTY FTL — data is unrecoverable afterwards.
+- Power-on-idle "soak" (power cable ONLY, no data; ~20-30 min on, 30 s off,
+  repeat) is data-safe and documented for post-power-loss housekeeping
+  recovery, but does NOT fix ROM-mode/placeholder bricks; minimize total
+  power-on time on degrading drives.
+
 ## Doctrine (learned the hard way)
 
 1. **Never mount a failing drive.** `mount_apfs` of a corrupt volume
@@ -163,6 +227,34 @@ diskutil mount readOnly diskNsM    # mount volumes from the image
 If mounting the image's APFS volume misbehaves (same apfs.kext code path), do
 it right after a fresh boot with no other jobs running, use the carve method
 instead, or fall back to `apfs-fuse` / professional tools against the image.
+
+### Triaging carve output (user data vs junk)
+
+Carving produces hundreds of thousands of files, most of them OS noise. The
+*Triage carved files* method (`40_`) classifies everything into
+`DEST/triage/{user_data,review,junk}/<category>/` using **hardlinks** —
+originals stay untouched in `recovered.N/`, and the sorted tree costs almost
+no extra disk space. It also writes `DEST/LABEL.triage.tsv` (one row per file:
+path, tier, category, reason, size) and prints a summary.
+
+Heuristics (single-pass Perl classifier — fast even at 300k+ files, stock on
+every macOS including 10.14):
+
+- **jpg/tiff**: camera EXIF make (Apple/Canon/Nikon/…) in the header → user
+  photo; EXIF + ≥256 KB → user photo; ≥2 MB without EXIF → review; small
+  without EXIF → cache junk. `<32 KB` → thumbnail junk.
+- **png**: parses IHDR dimensions from the header; ≥600 px min-side or ≥1 MB →
+  review (screenshots); else UI-asset junk.
+- **sqlite**: `.tables` scanned for user-content schemas (Photos ZASSET,
+  iMessage chat/message, WhatsApp/Messenger threads, Notes, Contacts,
+  Calendar, Mail, call history) → user database; unreadable+large → review.
+- **txt**: license/markup/code markers → junk; free text → review.
+- **heic/dng/raw, mov/mp4, m4a/mp3, pdf/Office/iWork, eml/vcf** → user data
+  by type. **plist/icns/fonts/source/web assets/small gz logs** → junk.
+- Unknown extensions and large archives → review.
+
+Triage is advisory: spot-check `review/` and skim `junk/image_cache` before
+telling a customer something is gone.
 
 `tools/bin/` holds GNU ddrescue 1.29 + ddrescuelog and PhotoRec 7.2 as
 **universal binaries** (`x86_64` + `arm64`, linking only system libs) built

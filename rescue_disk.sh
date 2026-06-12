@@ -63,8 +63,22 @@ fi
 [ "$(id -u)" -eq 0 ] || die "run with sudo (raw device access and fstab guards need root)"
 
 if [ "$CLEANUP" -eq 1 ]; then
-  sed -i '' '/# rescuekit:/d' /etc/fstab 2>/dev/null
-  echo "rescuekit fstab guard lines removed."
+  # Scope to this job's label unless explicitly told otherwise: other jobs'
+  # patients may still be on the bench relying on their guards.
+  if [ -n "$LABEL" ] && grep -q "# rescuekit:$LABEL\$" /etc/fstab 2>/dev/null; then
+    sed -i '' "/# rescuekit:$LABEL\$/d" /etc/fstab 2>/dev/null
+    echo "rescuekit fstab guards for label '$LABEL' removed."
+  else
+    others=$(grep -c "# rescuekit:" /etc/fstab 2>/dev/null || echo 0)
+    if [ "$others" -gt 0 ]; then
+      echo "No guards for label '$LABEL'; $others rescuekit guard line(s) from OTHER labels remain."
+      echo "Remove a specific job's guards:  --cleanup-fstab --label <that job's label>"
+      echo "Remove ALL rescuekit guards (only if no patients are on the bench):"
+      echo "  sudo sed -i '' '/# rescuekit:/d' /etc/fstab"
+    else
+      echo "No rescuekit guard lines present."
+    fi
+  fi
   exit 0
 fi
 
@@ -73,6 +87,20 @@ fi
 
 IMG="$DEST/$LABEL.img"; MAP="$DEST/$LABEL.map"
 STATE="$DEST/$LABEL.target"; LOGF="$DEST/$LABEL.log"
+
+# Per-job lock: two ddrescue writers on one mapfile tear it, losing the
+# record of what was already rescued from the dying drive.
+LOCK="$DEST/$LABEL.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -f "$LOCK/pid" ] && kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then
+    echo "FATAL: another run for label '$LABEL' is active (pid $(cat "$LOCK/pid"))."
+    exit 1
+  fi
+  echo "Removing stale lock from a previous run."
+  rm -rf "$LOCK"; mkdir "$LOCK" || exit 1
+fi
+echo $$ > "$LOCK/pid"
+
 exec > >(tee -a "$LOGF") 2>&1
 log "=== rescue_disk start; label=$LABEL dest=$DEST ==="
 
@@ -116,11 +144,30 @@ for d in $(diskutil info "$DEST" 2>/dev/null \
 done
 excluded() { case " $EXCL " in *" $1 "*) return 0;; *) return 1;; esac; }
 
-candidates() { for d in $(externals); do excluded "$d" || echo "$d"; done; }
+# Bridges with no working disk fabricate tiny placeholder LUNs (ASMedia: 21 MB);
+# auto-detect must never image one of those as the patient. --device still may.
+MIN_CANDIDATE_BYTES=50000000
+candidates() {
+  local d sz
+  for d in $(externals); do
+    excluded "$d" && continue
+    sz=$(pl "$d" TotalSize)
+    case "$sz" in ''|*[!0-9]*) continue;; esac
+    [ "$sz" -lt "$MIN_CANDIDATE_BYTES" ] && continue
+    echo "$d"
+  done
+}
 
 if [ -n "$DEVICE" ]; then
   DEVICE=$(wholeof "$DEVICE")
   excluded "$DEVICE" && die "--device $DEVICE is the destination's own disk"
+  if [ -e "/dev/$DEVICE" ] && pl "$DEVICE" Internal | grep -qix true; then
+    die "--device $DEVICE is an internal disk — patients are external; refusing"
+  fi
+  if [ -f "$STATE" ]; then
+    log "NOTE: saved target identity in $STATE overrides --device after a dropout."
+    log "      If the patient for this label changed, stop and: rm '$STATE'"
+  fi
 fi
 
 size_ok() {  # within 2% of --size-gb, if given
@@ -168,8 +215,20 @@ find_target() {  # echoes disk id; uses saved DiskUUID/size to survive renumberi
   return 1
 }
 
-guard_and_unmount() {  # $1 = physical whole disk
-  local d="$1" devid uuid fstype cont
+# apfs_children: "container volumeDisk volumeUUID" rows for containers whose
+# physical store lives on $1. Field positions are taken from the END of each
+# line: containers that are not listed last get a leading "|" continuation
+# column that shifts $1..$4.
+apfs_children() {
+  diskutil apfs list 2>/dev/null | awk -v phys="$1" '
+    /\+-- Container disk[0-9]+/ {cont=$(NF-1); ph=0}
+    /\+-< Physical Store disk[0-9]+/ {n=$(NF-1); sub(/(s[0-9]+)+$/,"",n); if (n==phys) ph=1}
+    ph && /\+-> Volume disk[0-9]+/ {print cont, $(NF-1), $NF}
+  '
+}
+
+guard_fstab() {  # $1 = physical whole disk; safe to run before the tech confirms
+  local d="$1" devid uuid fstype cont vol
   # fstab noauto per volume UUID: diskarbitration then leaves the patient alone.
   # Partition identifiers come from diskutil's text output (portable to 10.14).
   for devid in $(diskutil list "$d" 2>/dev/null \
@@ -179,24 +238,20 @@ guard_and_unmount() {  # $1 = physical whole disk
     grep -q "$uuid" /etc/fstab 2>/dev/null \
       || echo "UUID=$uuid none $fstype ro,noauto # rescuekit:$LABEL" >> /etc/fstab
   done
-  # APFS containers synthesize a sibling disk; guard its volumes and unmount it too.
-  diskutil apfs list 2>/dev/null | awk -v phys="$d" '
-    /\+-- Container disk/ {cont=$3; ph=0}
-    /\+-< Physical Store/ {n=$4; sub(/(s[0-9]+)+$/,"",n); if (n==phys) ph=1}
-    ph && /\+-> Volume disk/ {print cont, $3, $4}
-  ' | while read -r cont vol uuid; do
+  apfs_children "$d" | while read -r cont vol uuid; do
     grep -q "$uuid" /etc/fstab 2>/dev/null \
       || echo "UUID=$uuid none apfs ro,noauto # rescuekit:$LABEL" >> /etc/fstab
-    echo "$cont" >> "/tmp/rescuekit_containers.$$"
   done
-  if [ -f "/tmp/rescuekit_containers.$$" ]; then
-    sort -u "/tmp/rescuekit_containers.$$" | while read -r cont; do
-      diskutil unmountDisk force "$cont" >/dev/null 2>&1
-    done
-    rm -f "/tmp/rescuekit_containers.$$"
-  fi
+  log "fstab guards written for $d"
+}
+
+unmount_patient() {  # $1 = physical whole disk; runs only once imaging is a go
+  local d="$1" cont
+  apfs_children "$d" | awk '{print $1}' | sort -u | while read -r cont; do
+    diskutil unmountDisk force "$cont" >/dev/null 2>&1
+  done
   diskutil unmountDisk force "$d" >/dev/null 2>&1
-  log "fstab guards written; $d and synthesized siblings unmounted"
+  log "$d and synthesized siblings unmounted"
 }
 
 remaining_work() {  # 0 means every block was tried/trimmed/scraped
@@ -211,7 +266,7 @@ remaining_work() {  # 0 means every block was tried/trimmed/scraped
 
 mdutil -i off "$DEST" >/dev/null 2>&1
 caffeinate -dims & CAF=$!
-trap 'kill $CAF 2>/dev/null' EXIT
+trap 'kill $CAF 2>/dev/null; rm -rf "$LOCK"' EXIT
 
 CYCLE=0
 while :; do
@@ -226,12 +281,23 @@ while :; do
   done
   [ -n "$TARGET" ] || { log "no target appeared within 60 min"; break; }
 
+  # Guard immediately — the automount/fsck race starts the moment the disk
+  # enumerates; waiting for the confirm prompt leaves the patient exposed.
+  guard_fstab "$TARGET"
+
   if [ ! -f "$STATE" ]; then
     confirm "$TARGET" || die "declined; rerun with --device diskN or --size-gb N"
     SAVED_UUID=$(pl "$TARGET" DiskUUID)
     SAVED_SIZE=$(pl "$TARGET" TotalSize)
     SAVED_BS=$(pl "$TARGET" DeviceBlockSize)
     case "${SAVED_BS:-}" in ''|*[!0-9]*) SAVED_BS=512;; esac
+    # An intermittent patient can drop between detection and these reads;
+    # never persist an empty identity or resume is bricked until .target is
+    # hand-deleted.
+    if ! is_uint "${SAVED_SIZE:-}"; then
+      log "target dropped while reading its identity — retrying detection"
+      continue
+    fi
     printf 'SAVED_UUID=%s\nSAVED_SIZE=%s\nSAVED_BS=%s\n' \
       "$SAVED_UUID" "$SAVED_SIZE" "$SAVED_BS" > "$STATE"
     if [ "$FORCE" -ne 1 ] && [ ! -e "$IMG" ]; then
@@ -241,10 +307,16 @@ while :; do
     fi
   else
     . "$STATE"
+    if ! is_uint "${SAVED_SIZE:-}"; then
+      log "saved state in $STATE is invalid — discarding it and re-detecting"
+      rm -f "$STATE"
+      continue
+    fi
   fi
 
   log "target is $TARGET (uuid=${SAVED_UUID:-?} size=${SAVED_SIZE:-?} bs=${SAVED_BS:-?})"
-  guard_and_unmount "$TARGET"
+  unmount_patient "$TARGET"
+  [ -d "$DEST" ] || { log "FATAL: destination volume vanished — stopping before the pass"; exit 1; }
 
   if [ "$CYCLE" -eq 1 ] && [ ! -e "$MAP" ]; then
     PASSFLAGS="--no-scrape"           # grab the easy blocks first, fail fast past bad areas
@@ -256,6 +328,16 @@ while :; do
          "/dev/r$TARGET" "$IMG" "$MAP"
   RC=$?
   log "ddrescue exited rc=$RC"
+  # Disk numbers get recycled; if /dev/$TARGET was reassigned mid-pass,
+  # --reopen-on-error may have read a different device near the end.
+  if [ -e "/dev/$TARGET" ]; then
+    CURSZ=$(pl "$TARGET" TotalSize)
+    if [ -n "$CURSZ" ] && [ "$CURSZ" != "${SAVED_SIZE:-}" ]; then
+      log "WARNING: /dev/$TARGET now reports size $CURSZ (expected $SAVED_SIZE)."
+      log "WARNING: the device number was reassigned during the pass — treat the"
+      log "WARNING: tail of this pass with suspicion and rerun once re-acquired."
+    fi
+  fi
 
   LEFT=$(remaining_work)
   if [ "$LEFT" -eq 0 ] && [ "$CYCLE" -gt 1 ]; then

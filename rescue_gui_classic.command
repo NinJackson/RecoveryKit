@@ -146,6 +146,19 @@ set -- bash "$method" --dest "/Volumes/$dest" --label "$label"
 [ -n "$device" ] && set -- "$@" --device "$device"
 [ -n "$image" ]  && set -- "$@" --image "$image"
 
+# --- pre-flight confirmation: nothing runs until the tech approves the plan
+SUMMARY="Method: $pick\nDest: /Volumes/$dest\nLabel: $label\nSource: ${device:-auto-detect}\nImage: ${image:-default (<label>.img)}\nExtra: ${extra:-none}"
+CONF=$(/usr/bin/osascript <<EOF
+try
+  display dialog "$SUMMARY" with title "RescueKit — confirm before running" buttons {"Cancel", "Run"} default button "Run" with icon caution
+  return "ok"
+on error
+  return "no"
+end try
+EOF
+)
+[ "$CONF" = "ok" ] || { echo "Cancelled."; exit 0; }
+
 echo "============================================================"
 echo " RescueKit — running: $pick"
 echo " method:  $method"
