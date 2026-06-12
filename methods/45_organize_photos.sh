@@ -44,7 +44,13 @@ find "$INDIR" -type f -print0 2>/dev/null \
   mkdir -p "$D"
   B=$(basename "$f")
   T="$D/$B"; i=0
-  while [ -e "$T" ]; do i=$((i + 1)); T="$D/${i}_$B"; done
+  # same inode = this photo is already in the tree (re-run after adding
+  # rescue keepers must not double-link everything); only suffix true
+  # name collisions between different files
+  while [ -e "$T" ]; do
+    [ "$(stat -f%i "$T" 2>/dev/null)" = "$(stat -f%i "$f")" ] && continue 2
+    i=$((i + 1)); T="$D/${i}_$B"
+  done
   ln "$f" "$T" 2>/dev/null || cp "$f" "$T"
 done
 echo "[$(ts)] done — tree:"
