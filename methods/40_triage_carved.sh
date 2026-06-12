@@ -7,8 +7,20 @@
 # Tiers:  user_data  = high-confidence customer files (photos w/ EXIF, docs,
 #                      videos, message/photo databases, mail)
 #         review     = plausible user data needing a human eye (large images
-#                      without EXIF, free text, big archives, odd types)
+#                      without EXIF, photo derivatives, free text, archives)
 #         junk       = OS/app/cache noise (plists, UI images, fonts, logs)
+#
+# Classifier v2 (job-68930 audit lessons): EXIF-less jpgs >=50KB go to
+# review/image_derivatives, not junk — PhotoStream renditions, X-rays/scans
+# and edited exports live there, and on a partially-encrypted disk they can
+# be the only surviving copies. PNGs >=500KB are user screenshots/scans
+# (OS resources at the same pixel dims stay under 500KB). Camera-make
+# matching ignores "Copyright <vendor>" strings (Photos derivatives carry
+# "Copyright Apple Inc." and are NOT camera originals). Truncated carves
+# (4-32KB camera formats, videos without a moov/moof atom) are demoted;
+# oversized plists (>=2MB) are carve overruns/encrypted noise, not prefs;
+# multi-MB tiffs whose header claims icon dims are over-carved UI assets.
+# Untagged short audio is app SFX/TTS cache, not music.
 
 set -u
 DEST=""; LABEL=""; CARVED=""
@@ -86,7 +98,10 @@ BEGIN {
     while (<$sv>) { chomp; my @c = split /\t/, $_, 4; $sq{$c[0]} = [@c[1..3]] if @c == 4; }
     close $sv;
   }
-  $cam = qr/(Apple|Canon|Nikon|SONY|samsung|FUJIFILM|Panasonic|OLYMPUS|GoPro|DJI|Google|HUAWEI|Motorola|HTC|RICOH|PENTAX|KODAK|Hasselblad|Leica|SIGMA|Xiaomi|OnePlus)/i;
+  # 3-letter makes (HTC, DJI) are NOT here: case-insensitive over a 64KB
+  # binary peek they false-positive on ~3% of files. camera_make() matches
+  # them separately with EXIF-style NUL framing.
+  $cam = qr/(Apple|Canon|Nikon|SONY|samsung|FUJIFILM|Panasonic|OLYMPUS|GoPro|Google|HUAWEI|Motorola|RICOH|PENTAX|KODAK|Hasselblad|Leica|SIGMA|Xiaomi|OnePlus)/i;
   $n = 0;
 }
 chomp; my $f = $_;
@@ -95,35 +110,176 @@ my $sz = (lstat($f))[7] // 0;
 my ($tier, $cat, $why);
 
 sub peek { my ($f, $len) = @_; my $b = ""; if (open(my $fh, "<", $f)) { read($fh, $b, $len); close $fh; } return $b; }
+sub peek_tail { my ($f, $len) = @_; my $b = ""; my $s = (lstat($f))[7] // 0;
+  if (open(my $fh, "<", $f)) { seek($fh, $s > $len ? $s - $len : 0, 0); read($fh, $b, $len); close $fh; }
+  return $b; }
+# Camera make, ignoring copyright notices: Photos-library derivatives embed
+# "Copyright Apple Inc." which is NOT camera provenance. Short makes need a
+# trailing NUL (EXIF strings are NUL-terminated) to not match random bytes.
+sub camera_make { my ($b) = @_; (my $s = $b) =~ s/Copyright[\x20-\x7e]{0,80}//g;
+  return $1 if $s =~ $cam;
+  return $1 if $s =~ /(HTC|DJI)\x00/;
+  return ""; }
+# Walk top-level ISO-BMFF boxes looking for a moov/moof index. A grep of
+# head+tail windows misses long recordings whose moov tables exceed the
+# window; the box walk follows the declared mdat size straight to it.
+sub bmff_has_index {
+  my ($f) = @_;
+  open(my $fh, "<", $f) or return 0; binmode $fh;
+  my $sz = (stat($fh))[7] // 0;
+  my ($pos, $n) = (0, 0);
+  while ($pos + 8 <= $sz && $n++ < 64) {
+    seek($fh, $pos, 0) or last;
+    my $hdr = ""; last if read($fh, $hdr, 16) < 8;
+    my ($len, $typ) = (unpack("N", substr($hdr, 0, 4)), substr($hdr, 4, 4));
+    last unless $typ =~ /^[\x20-\x7e]{4}$/;          # garbage = not a box chain
+    if ($typ eq "moov" || $typ eq "moof") { close $fh; return 1; }
+    if    ($len == 0) { last; }                       # box runs to EOF
+    elsif ($len == 1) {                               # 64-bit size
+      last if length($hdr) < 16;
+      my ($hi, $lo) = unpack("NN", substr($hdr, 8, 8));
+      $len = $hi * 4294967296 + $lo;
+      last if $len < 16;
+    }
+    last if $len < 8;
+    $pos += $len;
+  }
+  close $fh; return 0;
+}
+# JPEG pixel dims: walk segments from SOI so the EXIF APP1 blob (which holds
+# a thumbnail with its own SOF) is skipped, not matched.
+sub jpeg_dims {
+  my ($b) = @_; my $L = length($b);
+  return (0, 0) unless $L >= 4 && substr($b, 0, 2) eq "\xFF\xD8";
+  my $i = 2;
+  while ($i + 9 <= $L) {
+    if (substr($b, $i, 1) ne "\xFF") { last; }
+    my $m = ord(substr($b, $i + 1, 1));
+    if ($m == 0xFF) { $i++; next; }                       # fill byte
+    if ($m == 0x01 || ($m >= 0xD0 && $m <= 0xD8)) { $i += 2; next; }  # standalone
+    last if $m == 0xD9 || $m == 0xDA;                     # EOI / scan start
+    my $len = unpack("n", substr($b, $i + 2, 2)) // 0;
+    last if $len < 2;
+    if ($m >= 0xC0 && $m <= 0xCF && $m != 0xC4 && $m != 0xC8 && $m != 0xCC) {
+      return (unpack("n", substr($b, $i + 7, 2)) // 0, unpack("n", substr($b, $i + 5, 2)) // 0);
+    }
+    $i += 2 + $len;
+  }
+  return (0, 0);
+}
+# TIFF pixel dims from the first IFD (tags 256/257), both byte orders.
+sub tiff_dims {
+  my ($b) = @_; my $L = length($b);
+  return (0, 0) unless $L >= 8;
+  my $end = substr($b, 0, 2);
+  return (0, 0) unless $end eq "II" || $end eq "MM";
+  my ($l32, $l16) = $end eq "II" ? ("V", "v") : ("N", "n");
+  my $off = unpack($l32, substr($b, 4, 4)) // 0;
+  return (0, 0) if $off < 8 || $off + 2 > $L;
+  my $cnt = unpack($l16, substr($b, $off, 2)) // 0;
+  my ($w, $h) = (0, 0);
+  for my $k (0 .. ($cnt > 64 ? 63 : $cnt - 1)) {
+    my $e = $off + 2 + 12 * $k;
+    last if $e + 12 > $L;
+    my $tag = unpack($l16, substr($b, $e, 2));
+    my $typ = unpack($l16, substr($b, $e + 2, 2));
+    my $val = $typ == 3 ? unpack($l16, substr($b, $e + 8, 2)) : unpack($l32, substr($b, $e + 8, 4));
+    $w = $val if $tag == 256; $h = $val if $tag == 257;
+    last if $w && $h;
+  }
+  return ($w, $h);
+}
 
 if (exists $sq{$f}) { ($tier, $cat, $why) = @{$sq{$f}}; }
-elsif ($ext =~ /^(heic|heif|dng|nef|cr2|arw|orf|raf)$/) { ($tier,$cat,$why)=("user_data","photos","camera format"); }
-elsif ($ext =~ /^(mov|mp4|m4v|avi|mts|3gp)$/) { ($tier,$cat,$why)=("user_data","videos","video"); }
-elsif ($ext =~ /^(m4a|mp3|wav|aiff|aac|flac)$/) { ($tier,$cat,$why)=("user_data","audio","audio"); }
-elsif ($ext =~ /^(pdf|docx?|xlsx?|pptx?|pages|numbers|key|rtfd?|csv|ai|psd|epub)$/) { ($tier,$cat,$why)=("user_data","documents","document"); }
-elsif ($ext =~ /^(eml|emlx|vcf|ics)$/) { ($tier,$cat,$why)=("user_data","mail_contacts","mail/contact"); }
+elsif ($ext =~ /^(heic|heif|dng|nef|cr2|arw|orf|raf)$/) {
+  # a 4-32KB "camera format" file is a truncated carve, not a photo
+  ($tier,$cat,$why) = $sz < 32768 ? ("junk","image_cache","truncated $ext carve")
+                                  : ("user_data","photos","camera format");
+}
+elsif ($ext =~ /^(mov|mp4|m4v|avi|mts|3gp)$/) {
+  if ($ext eq "avi" || $ext eq "mts") { ($tier,$cat,$why)=("user_data","videos","video"); }
+  else {
+    # ISO-BMFF without a moov/moof atom has no index — unplayable fragment
+    if (bmff_has_index($f) || peek_tail($f, 65536) =~ /moov|moof/)
+         { ($tier,$cat,$why)=("user_data","videos","video"); }
+    else { ($tier,$cat,$why)=("review","truncated_media","no moov atom (truncated/encrypted; repair candidate)"); }
+  }
+}
+elsif ($ext =~ /^(m4a|mp3|wav|aiff|aac|flac)$/) {
+  my $b = peek($f, 65536); my $t = peek_tail($f, 128);
+  if ($b =~ /^ID3/ || $t =~ /^TAG/ || $b =~ /\xA9(?:nam|ART|alb)|covr|aART/
+      || ($ext eq "flac" && $b =~ /^fLaC/ && $b =~ /(?:TITLE|ARTIST|ALBUM)=/i))
+       { ($tier,$cat,$why)=("user_data","audio","tagged music"); }
+  elsif ($sz >= 2097152) { ($tier,$cat,$why)=("review","audio","untagged, large"); }
+  elsif ($ext eq "m4a" && $sz >= 512000)
+       { ($tier,$cat,$why)=("review","audio","untagged m4a (voice memo?)"); }
+  else { ($tier,$cat,$why)=("junk","app_sounds","untagged short clip (app/system sound)"); }
+}
+elsif ($ext =~ /^(pdf|docx?|xlsx?|pptx?|pages|numbers|key|psd|epub)$/) {
+  # sub-20KB carved PDFs are nearly all vector/icon assets, not documents
+  ($tier,$cat,$why) = ($ext eq "pdf" && $sz < 20480)
+    ? ("review","documents","tiny pdf (often vector/icon asset)")
+    : ("user_data","documents","document");
+}
+elsif ($ext =~ /^(rtfd?|ai)$/) { ($tier,$cat,$why)=("review","documents","$ext (often app/design resource)"); }
+elsif ($ext eq "csv") { ($tier,$cat,$why)=("review","text","csv (often misdetected fragment)"); }
+elsif ($ext eq "vcf") {
+  my $b = peek($f, 4096);
+  ($tier,$cat,$why) = $b =~ /TipCard/ ? ("junk","web_assets","Apple TipCard vcard")
+                                      : ("user_data","mail_contacts","contact card");
+}
+elsif ($ext eq "ics") {
+  my $b = peek($f, 65536);   # VTIMEZONE blocks can push the first VEVENT deep
+  ($tier,$cat,$why) = $b =~ /BEGIN:VEVENT/ ? ("user_data","mail_contacts","calendar events")
+                                           : ("junk","logs_caches","alarm/no-event ics fragment");
+}
+elsif ($ext =~ /^(eml|emlx)$/) { ($tier,$cat,$why)=("user_data","mail_contacts","mail/contact"); }
 elsif ($ext eq "jpg" || $ext eq "jpeg") {
   if ($sz < 32768) { ($tier,$cat,$why)=("junk","image_cache","thumbnail-size"); }
   else {
-    my $b = peek($f, 16384);
-    if ($b =~ $cam)                          { ($tier,$cat,$why)=("user_data","photos","camera EXIF: $1"); }
-    elsif ($b =~ /Exif/ && $sz >= 262144)    { ($tier,$cat,$why)=("user_data","photos","EXIF present"); }
-    elsif ($sz >= 2097152)                   { ($tier,$cat,$why)=("review","images","large, no EXIF"); }
-    else                                     { ($tier,$cat,$why)=("junk","image_cache","no EXIF, small"); }
+    my $b = peek($f, 65536);
+    my $mk = camera_make($b);
+    if ($mk)                              { ($tier,$cat,$why)=("user_data","photos","camera EXIF: $mk"); }
+    elsif ($b =~ /Exif/ && $sz >= 262144) { ($tier,$cat,$why)=("user_data","photos","EXIF present"); }
+    else {
+      my ($w, $h) = jpeg_dims($b);
+      my $d = ($w && $h) ? "${w}x${h}" : "dims unknown";
+      # EXIF-less >=50KB jpgs are PhotoStream/Photos renditions, X-rays,
+      # scans, edited exports — possibly the only surviving copy. Human eye.
+      if    ($sz >= 2097152) { ($tier,$cat,$why)=("review","images","large, no EXIF, $d"); }
+      elsif ($sz >= 51200)   { ($tier,$cat,$why)=("review","image_derivatives","no EXIF, $d"); }
+      else                   { ($tier,$cat,$why)=("junk","image_cache","no EXIF, small, $d"); }
+    }
   }
 }
 elsif ($ext eq "png") {
   my $b = peek($f, 24);
   my ($w, $h) = (length($b) >= 24) ? unpack("NN", substr($b, 16, 8)) : (0, 0);
+  my $ok = ($w >= 1 && $h >= 1 && $w <= 20000 && $h <= 20000);
   my $min = $w < $h ? $w : $h;
-  if ($min >= 600 || $sz >= 1048576) { ($tier,$cat,$why)=("review","images","${w}x${h}"); }
-  else                               { ($tier,$cat,$why)=("junk","system_images","${w}x${h} UI asset"); }
+  # >=500KB separates user screenshots/scans from OS resources at equal dims
+  if    ($ok && $sz >= 512000) { ($tier,$cat,$why)=("user_data","screenshots","${w}x${h} screenshot/scan"); }
+  elsif (!$ok)                 { ($tier,$cat,$why) = $sz >= 512000
+                                   ? ("review","images","undecodable png header")
+                                   : ("junk","system_images","corrupt png header"); }
+  elsif ($min >= 600)          { ($tier,$cat,$why)=("review","images","${w}x${h}"); }
+  else                         { ($tier,$cat,$why)=("junk","system_images","${w}x${h} UI asset"); }
 }
 elsif ($ext =~ /^(tif|tiff)$/) {
-  my $b = peek($f, 16384);
-  if ($b =~ $cam)            { ($tier,$cat,$why)=("user_data","photos","camera EXIF: $1"); }
-  elsif ($sz >= 1048576)     { ($tier,$cat,$why)=("review","images","large tiff"); }
-  else                       { ($tier,$cat,$why)=("junk","system_images","small tiff"); }
+  if ($sz < 32768) { ($tier,$cat,$why)=("junk","system_images","small tiff"); }
+  else {
+    my $b = peek($f, 65536);
+    my $mk = camera_make($b);
+    my ($w, $h) = tiff_dims($b);
+    my $max = $w > $h ? $w : $h; my $min = $w < $h ? $w : $h;
+    if    ($mk)        { ($tier,$cat,$why)=("user_data","photos","camera EXIF: $mk"); }
+    elsif ($min >= 960){ ($tier,$cat,$why)=("review","images","${w}x${h} tiff"); }
+    elsif ($sz >= 1048576 && $max && $max < 256)
+                       { ($tier,$cat,$why)=("junk","system_images","icon tiff (over-carve, ${w}x${h})"); }
+    elsif ($sz >= 1048576)
+                       { ($tier,$cat,$why)=("review","images","large tiff"); }
+    else               { ($tier,$cat,$why)=("junk","system_images","small tiff"); }
+  }
 }
 elsif ($ext eq "txt") {
   my $b = peek($f, 2048);
@@ -134,7 +290,13 @@ elsif ($ext eq "txt") {
 elsif ($ext eq "gz")  { ($tier,$cat,$why) = $sz >= 1048576 ? ("review","archives","large gz") : ("junk","logs_caches","rotated log/cache"); }
 elsif ($ext =~ /^(zip|dmg|tar|7z|rar)$/) { ($tier,$cat,$why)=("review","archives","archive"); }
 elsif ($ext eq "gif") { ($tier,$cat,$why) = $sz >= 1048576 ? ("review","images","large gif") : ("junk","web_assets","small gif"); }
-elsif ($ext eq "plist") { ($tier,$cat,$why)=("junk","plists","preferences/config"); }
+elsif ($ext eq "plist") {
+  # real prefs are KB-scale; multi-MB "plists" are signature misfires
+  # carving encrypted-region noise or over-carve overruns
+  ($tier,$cat,$why) = $sz >= 2097152
+    ? ("junk","carve_noise","oversized plist (carve overrun/encrypted noise)")
+    : ("junk","plists","preferences/config");
+}
 elsif ($ext =~ /^(icns|ico|ttf|otf|woff2?|car|nib)$/) { ($tier,$cat,$why)=("junk","fonts_ui","UI resource"); }
 elsif ($ext =~ /^(html?|css|js|xml|svg|json|strings)$/) { ($tier,$cat,$why)=("junk","web_assets","web/markup"); }
 elsif ($ext =~ /^(java|h|c|cpp|hpp|m|mm|pm|pl|py|sh|rb|f|swift|go)$/) { ($tier,$cat,$why)=("junk","source_code","OS/dev source"); }
@@ -168,5 +330,6 @@ awk -F'\t' '
 echo "=================================================="
 echo "[$(ts)] sorted tree:  $TRIAGE/{user_data,review,junk}/<category>/"
 echo "[$(ts)] full report:  $TSV"
-echo "[$(ts)] start with:   user_data/photos, user_data/documents, user_data/databases"
-echo "[$(ts)] then skim:    review/images (screenshots etc.), review/text, review/archives"
+echo "[$(ts)] start with:   user_data/photos, user_data/screenshots, user_data/documents, user_data/databases"
+echo "[$(ts)] then skim:    review/image_derivatives (EXIF-less renditions — often real photos),"
+echo "[$(ts)]               review/images, review/truncated_media, review/text, review/archives"

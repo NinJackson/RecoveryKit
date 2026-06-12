@@ -56,7 +56,9 @@ appears in the GUI, no app rebuild needed. Contract:
   image (mounts it), `25_` extract WITHOUT mounting (Sleuth Kit — names and
   folders, zero kernel-mount risk), `30_` carve an unreadable image,
   `35_` deduplicate recovered output, `40_` triage carved files into user
-  data vs junk, `45_` organize photos by EXIF date, `60_` package customer
+  data vs junk, `42_` rescue real photos from an earlier triage's junk tier
+  (dimension-based re-screen into `triage/rescued/` for a human eyeball),
+  `45_` organize photos by EXIF date, `60_` package customer
   delivery (manifest + README), `70_` generate the final job report,
   `80_` archive job artifacts with hash verification, `90_` remove fstab
   guards (label-scoped).
@@ -238,23 +240,49 @@ no extra disk space. It also writes `DEST/LABEL.triage.tsv` (one row per file:
 path, tier, category, reason, size) and prints a summary.
 
 Heuristics (single-pass Perl classifier — fast even at 300k+ files, stock on
-every macOS including 10.14):
+every macOS including 10.14; "v2" rules come from a full audit of a real
+306k-file job):
 
 - **jpg/tiff**: camera EXIF make (Apple/Canon/Nikon/…) in the header → user
-  photo; EXIF + ≥256 KB → user photo; ≥2 MB without EXIF → review; small
-  without EXIF → cache junk. `<32 KB` → thumbnail junk.
-- **png**: parses IHDR dimensions from the header; ≥600 px min-side or ≥1 MB →
-  review (screenshots); else UI-asset junk.
+  photo — but `Copyright <vendor>` strings are ignored (Photos-library
+  derivatives embed "Copyright Apple Inc." and are not camera originals);
+  EXIF + ≥256 KB → user photo; ≥2 MB without EXIF → review. **EXIF-less
+  jpgs ≥50 KB → `review/image_derivatives`** (SOF-decoded dims in the reason):
+  PhotoStream renditions, X-rays/scans and edited exports live there, and on
+  a partially-encrypted disk they can be the only surviving copies. `<32 KB`
+  → thumbnail junk. Multi-MB tiffs whose header claims icon dims (≤256 px)
+  are over-carved UI assets → junk.
+- **png**: parses IHDR dimensions; **≥500 KB → `user_data/screenshots`**
+  (user screenshots/scans — OS resources at the same pixel dims stay under
+  500 KB); ≥600 px min-side → review; corrupt dims (0 or >20k px) → junk;
+  else UI-asset junk.
 - **sqlite**: `.tables` scanned for user-content schemas (Photos ZASSET,
   iMessage chat/message, WhatsApp/Messenger threads, Notes, Contacts,
   Calendar, Mail, call history) → user database; unreadable+large → review.
+- **video**: mov/mp4/m4v/3gp without a `moov`/`moof` atom (head or tail) →
+  `review/truncated_media` — unplayable fragments, possible repair
+  candidates (untrunc + a reference clip from the same camera).
+- **audio**: tagged (ID3/iTunes `©nam` atoms) → user music; untagged ≥2 MB →
+  review; untagged short clips → junk (app SFX/TTS cache — a real music
+  library carves out tagged).
+- **documents**: pdf/docx/xlsx/iWork/psd → user data, except sub-20 KB PDFs
+  (vector/icon assets) → review; rtf and .ai → review (app localization
+  text and clip-art masquerade as documents); csv → review (mostly
+  misdetected fragments).
+- **truncated carves**: 4–32 KB "camera format" files (heic/dng/raw) → junk;
+  plists ≥2 MB → `junk/carve_noise` (signature misfires on encrypted-region
+  noise — on one job these were 71% of all junk bytes).
+- **vcf/ics**: Apple TipCard vcards and event-less VALARM fragments → junk;
+  real contact cards and calendars → user data.
 - **txt**: license/markup/code markers → junk; free text → review.
-- **heic/dng/raw, mov/mp4, m4a/mp3, pdf/Office/iWork, eml/vcf** → user data
-  by type. **plist/icns/fonts/source/web assets/small gz logs** → junk.
 - Unknown extensions and large archives → review.
 
-Triage is advisory: spot-check `review/` and skim `junk/image_cache` before
-telling a customer something is gone.
+Triage is advisory: spot-check `review/` (especially `image_derivatives/`)
+before telling a customer something is gone. For jobs triaged with the v1
+classifier, run `42_` — it re-screens `junk/image_cache` by pixel dimensions
+into `triage/rescued/{phone_screen,hires,camera,derivative}/` buckets for
+a fast human pass (on the audit job this recovered vet X-rays, registration
+screenshots and family photos that v1 had filed as junk).
 
 `tools/bin/` holds GNU ddrescue 1.29 + ddrescuelog and PhotoRec 7.2 as
 **universal binaries** (`x86_64` + `arm64`, linking only system libs) built

@@ -25,8 +25,11 @@ trap 'kill $CAF 2>/dev/null' EXIT
 mkdir -p "$OUT/undated"
 
 N=0; DATED=0
-find "$INDIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' \
-  -o -iname '*.png' -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.dng' \) -print0 2>/dev/null \
+# No extension filter: everything triage put in user_data/photos IS a photo,
+# and 60_package skips triage/user_data/photos when this tree exists — any
+# format missed here would silently vanish from the customer package.
+# Formats sips can't read just land in undated/.
+find "$INDIR" -type f -print0 2>/dev/null \
 | while IFS= read -r -d '' f; do
   N=$((N + 1)); [ $((N % 2000)) -eq 0 ] && echo "[progress] $N photos processed"
   # sips reads the EXIF creation date: "creation: 2021:06:12 10:33:21"

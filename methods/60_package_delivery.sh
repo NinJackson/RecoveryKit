@@ -26,18 +26,38 @@ FOUND=0
 for src in "delivery/photos" "extracted" "tsk_extracted" "triage/user_data"; do
   [ -d "$DEST/$src" ] || continue
   FOUND=1
+  # When the date-sorted photo tree exists, the same photos must not ship a
+  # second time out of triage/user_data/photos — skip that subtree. But only
+  # if delivery/photos really is a superset: an interrupted 45_ run leaves a
+  # partial tree, and skipping then would silently drop photos from the
+  # package. Shipping twice is the safe direction.
+  SKIP=""
+  if [ "$src" = "triage/user_data" ] && [ -d "$DEST/delivery/photos" ] \
+     && [ -d "$DEST/triage/user_data/photos" ]; then
+    NP=$(find "$DEST/triage/user_data/photos" -type f 2>/dev/null | wc -l | tr -d ' ')
+    ND=$(find "$DEST/delivery/photos" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$ND" -ge "$NP" ]; then
+      SKIP="photos/"
+      echo "[$(ts)] note: skipping triage/user_data/photos ($NP files already date-sorted in delivery/photos)"
+    else
+      echo "[$(ts)] WARNING: delivery/photos has $ND files but triage/user_data/photos has $NP —"
+      echo "[$(ts)]          date-sort looks incomplete; shipping BOTH trees (duplicates beat data loss)."
+      echo "[$(ts)]          Re-run 45_organize_photos and re-package to fix."
+    fi
+  fi
   name=$(echo "$src" | tr '/' '_')
   echo "[$(ts)] linking $src -> $PKG/$name/"
   find "$DEST/$src" -type f -print0 2>/dev/null | /usr/bin/perl -0 -ne '
 BEGIN { use File::Path qw(make_path); use File::Copy qw(copy);
-        ($ROOT, $OUT) = @ARGV; @ARGV = (); }
+        ($ROOT, $OUT, $SKIP) = @ARGV; @ARGV = (); }
 chomp; my $f = $_;
 (my $rel = $f) =~ s/^\Q$ROOT\E\/?//;
+next if $SKIP ne "" && index($rel, $SKIP) == 0;
 my $t = "$OUT/$rel";
 (my $d = $t) =~ s{/[^/]+$}{};
 make_path($d) unless -d $d;
 -e $t or link($f, $t) or copy($f, $t);
-' "$DEST/$src" "$PKG/$name"
+' "$DEST/$src" "$PKG/$name" "$SKIP"
 done
 [ "$FOUND" -eq 1 ] || { echo "[$(ts)] nothing to package — run extraction/triage first"; exit 1; }
 
